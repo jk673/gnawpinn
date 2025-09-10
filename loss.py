@@ -1,412 +1,446 @@
+"""
+Corrected Comprehensive Loss Functions for Pressure and Wall Shear Stress Data
+Based on actual data structure: [pressure_coefficient, tau_x, tau_y, tau_z]
+"""
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+from typing import Dict, List, Tuple, Optional, Any
 
-# ============================================
-# Physics Loss Functions (CUDA-aware)
-# ============================================
-
-def compute_physics_loss(pred, batch):
-    """Compute physics-informed loss (simplified example)"""
-    loss = torch.zeros(1, device=pred.device)
+class CorrectedPINNLoss(nn.Module):
+    """Physics-informed loss for pressure coefficients and wall shear stress components"""
     
-    if hasattr(batch, 'pos'):
-        pos = batch.pos.to(pred.device)
-        edge_index = batch.edge_index.to(pred.device)
+    def __init__(self, loss_weights: Optional[Dict[str, float]] = None):
+        super().__init__()
         
-        src, dst = edge_index
-        pred_diff = pred[src] - pred[dst]
-        pos_diff = pos[src] - pos[dst]
-        dist = torch.norm(pos_diff, dim=1, keepdim=True) + 1e-8
+        # Corrected loss weights for available data
+        self.default_weights = {
+            'mse': 1.0,                          # Primary data fitting loss
+            'pressure_smoothness': 0.20,         # Pressure field smoothness
+            'shear_stress_smoothness': 0.15,     # WSS field smoothness
+            'shear_stress_magnitude': 0.12,      # WSS magnitude consistency
+            'pressure_gradient': 0.18,           # Pressure gradient constraints
+            'wall_shear_balance': 0.15,          # WSS component balance
+            'boundary_pressure': 0.20,           # Pressure boundary conditions
+            'boundary_shear': 0.15,              # Shear boundary conditions
+            'physical_consistency': 0.10,        # Physical range constraints
+            'multi_component_correlation': 0.08, # Correlation between components
+            'spatial_coherence': 0.12,           # Spatial field coherence
+        }
         
-        # Weighted smoothness by inverse distance
-        loss = (pred_diff.pow(2) / dist).mean()
+        self.loss_weights = loss_weights or self.default_weights.copy()
     
-    return loss
+    def compute_spatial_gradients(self, predictions: torch.Tensor, pos: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Compute spatial gradients for pressure and shear stress fields"""
+        gradients = {}
+        
+        if predictions.requires_grad and pos.requires_grad:
+            try:
+                # predictions: [N, 4] -> [pressure_coeff, tau_x, tau_y, tau_z]
+                
+                # Pressure coefficient gradients
+                p_coeff = predictions[:, 0:1]
+                if pos.shape[1] >= 2:
+                    dp_dx = torch.autograd.grad(
+                        p_coeff.sum(), pos, create_graph=True, retain_graph=True, allow_unused=True
+                    )[0]
+                    if dp_dx is not None:
+                        gradients.update({'dp_dx': dp_dx[:, 0:1], 'dp_dy': dp_dx[:, 1:2]})
+                
+                # Wall shear stress gradients
+                tau_x = predictions[:, 1:2]
+                tau_y = predictions[:, 2:3] 
+                
+                if pos.shape[1] >= 2:
+                    dtaux_dx = torch.autograd.grad(
+                        tau_x.sum(), pos, create_graph=True, retain_graph=True, allow_unused=True
+                    )[0]
+                    dtauy_dx = torch.autograd.grad(
+                        tau_y.sum(), pos, create_graph=True, retain_graph=True, allow_unused=True
+                    )[0]
+                    
+                    if dtaux_dx is not None and dtauy_dx is not None:
+                        gradients.update({
+                            'dtaux_dx': dtaux_dx[:, 0:1], 'dtaux_dy': dtaux_dx[:, 1:2],
+                            'dtauy_dx': dtauy_dx[:, 0:1], 'dtauy_dy': dtauy_dx[:, 1:2]
+                        })
+            except Exception as e:
+                print(f"Gradient computation failed: {e}")
+                pass
+        
+        return gradients
+    
+    def pressure_smoothness_loss(self, predictions: torch.Tensor, pos: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Pressure field smoothness constraints"""
+        try:
+            gradients = self.compute_spatial_gradients(predictions, pos)
+            
+            if 'dp_dx' in gradients and 'dp_dy' in gradients:
+                # Pressure gradient magnitude
+                pressure_grad_mag = torch.sqrt(gradients['dp_dx']**2 + gradients['dp_dy']**2 + 1e-8)
+                
+                # Smoothness: penalize large variations in pressure gradient
+                if len(pressure_grad_mag) > 1:
+                    grad_variation = torch.diff(pressure_grad_mag, dim=0)
+                    smoothness_loss = torch.mean(grad_variation**2)
+                else:
+                    smoothness_loss = torch.tensor(0.0, device=predictions.device)
+                
+                return {
+                    'pressure_smoothness_loss': smoothness_loss,
+                    'mean_pressure_gradient': torch.mean(pressure_grad_mag),
+                    'max_pressure_gradient': torch.max(pressure_grad_mag)
+                }
+            else:
+                # Fallback: simple pressure variation
+                p_coeff = predictions[:, 0]
+                if len(p_coeff) > 1:
+                    p_variation = torch.diff(p_coeff)
+                    smoothness_loss = torch.var(p_variation)
+                else:
+                    smoothness_loss = torch.tensor(0.0, device=predictions.device)
+                
+                return {
+                    'pressure_smoothness_loss': smoothness_loss,
+                    'mean_pressure_gradient': torch.tensor(0.0, device=predictions.device),
+                    'max_pressure_gradient': torch.tensor(0.0, device=predictions.device)
+                }
+                
+        except Exception as e:
+            print(f"Warning: Pressure smoothness loss failed: {e}")
+            return {
+                'pressure_smoothness_loss': torch.tensor(0.0, device=predictions.device),
+                'mean_pressure_gradient': torch.tensor(0.0, device=predictions.device),
+                'max_pressure_gradient': torch.tensor(0.0, device=predictions.device)
+            }
+    
+    def shear_stress_losses(self, predictions: torch.Tensor, pos: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Wall shear stress consistency and smoothness losses"""
+        try:
+            tau_x, tau_y, tau_z = predictions[:, 1], predictions[:, 2], predictions[:, 3]
+            
+            # 1. Shear stress magnitude consistency
+            tau_magnitude = torch.sqrt(tau_x**2 + tau_y**2 + tau_z**2 + 1e-8)
+            
+            # 2. Smoothness of individual components
+            smoothness_losses = []
+            if len(tau_x) > 1:
+                smoothness_losses.extend([
+                    torch.mean(torch.diff(tau_x)**2),
+                    torch.mean(torch.diff(tau_y)**2),
+                    torch.mean(torch.diff(tau_z)**2)
+                ])
+            
+            smoothness_loss = torch.stack(smoothness_losses).mean() if smoothness_losses else torch.tensor(0.0, device=predictions.device)
+            
+            # 3. Magnitude smoothness
+            if len(tau_magnitude) > 1:
+                magnitude_smoothness = torch.mean(torch.diff(tau_magnitude)**2)
+            else:
+                magnitude_smoothness = torch.tensor(0.0, device=predictions.device)
+            
+            # 4. Component balance (no single component dominates unrealistically)
+            component_balance = torch.var(torch.stack([torch.mean(torch.abs(tau_x)), 
+                                                     torch.mean(torch.abs(tau_y)), 
+                                                     torch.mean(torch.abs(tau_z))]))
+            
+            return {
+                'shear_stress_smoothness_loss': smoothness_loss,
+                'shear_stress_magnitude_loss': magnitude_smoothness,
+                'shear_component_balance_loss': component_balance,
+                'mean_shear_magnitude': torch.mean(tau_magnitude),
+                'max_shear_magnitude': torch.max(tau_magnitude),
+                'shear_x_rms': torch.sqrt(torch.mean(tau_x**2)),
+                'shear_y_rms': torch.sqrt(torch.mean(tau_y**2)),
+                'shear_z_rms': torch.sqrt(torch.mean(tau_z**2))
+            }
+            
+        except Exception as e:
+            print(f"Warning: Shear stress loss computation failed: {e}")
+            return {
+                'shear_stress_smoothness_loss': torch.tensor(0.0, device=predictions.device),
+                'shear_stress_magnitude_loss': torch.tensor(0.0, device=predictions.device),
+                'shear_component_balance_loss': torch.tensor(0.0, device=predictions.device),
+                'mean_shear_magnitude': torch.tensor(0.0, device=predictions.device),
+                'max_shear_magnitude': torch.tensor(0.0, device=predictions.device),
+                'shear_x_rms': torch.tensor(0.0, device=predictions.device),
+                'shear_y_rms': torch.tensor(0.0, device=predictions.device),
+                'shear_z_rms': torch.tensor(0.0, device=predictions.device)
+            }
+    
+    def wall_shear_balance_loss(self, predictions: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Enforce physical balance between shear stress components"""
+        try:
+            tau_x, tau_y, tau_z = predictions[:, 1], predictions[:, 2], predictions[:, 3]
+            
+            # Physical constraint: shear stress should have coherent directional patterns
+            # No single component should be orders of magnitude larger than others consistently
+            
+            tau_magnitude = torch.sqrt(tau_x**2 + tau_y**2 + tau_z**2 + 1e-8)
+            
+            # Normalized components
+            tau_x_norm = tau_x / (tau_magnitude + 1e-8)
+            tau_y_norm = tau_y / (tau_magnitude + 1e-8)
+            tau_z_norm = tau_z / (tau_magnitude + 1e-8)
+            
+            # Balance loss: prevent extreme dominance of single component
+            component_ratios = torch.stack([
+                torch.abs(tau_x_norm),
+                torch.abs(tau_y_norm), 
+                torch.abs(tau_z_norm)
+            ], dim=1)
+            
+            # Penalize when one component is consistently >> others
+            max_component = torch.max(component_ratios, dim=1)[0]
+            balance_loss = torch.mean((max_component - 0.577)**2)  # 0.577 = 1/sqrt(3) for balanced case
+            
+            return {
+                'wall_shear_balance_loss': balance_loss,
+                'mean_max_component_ratio': torch.mean(max_component),
+                'component_balance_std': torch.std(max_component)
+            }
+            
+        except Exception as e:
+            print(f"Warning: Wall shear balance loss failed: {e}")
+            return {
+                'wall_shear_balance_loss': torch.tensor(0.0, device=predictions.device),
+                'mean_max_component_ratio': torch.tensor(0.0, device=predictions.device),
+                'component_balance_std': torch.tensor(0.0, device=predictions.device)
+            }
+    
+    def physical_consistency_loss(self, predictions: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Enforce physical range and consistency constraints"""
+        try:
+            p_coeff = predictions[:, 0]
+            tau_x, tau_y, tau_z = predictions[:, 1], predictions[:, 2], predictions[:, 3]
+            
+            # 1. Pressure coefficient should be reasonable (typically -2 to 2 for most flows)
+            p_range_penalty = torch.mean(F.relu(torch.abs(p_coeff) - 3.0))  # Penalty for |Cp| > 3
+            
+            # 2. Shear stress components should not be extreme
+            tau_magnitude = torch.sqrt(tau_x**2 + tau_y**2 + tau_z**2 + 1e-8)
+            tau_range_penalty = torch.mean(F.relu(tau_magnitude - 10.0))  # Penalty for extreme shear
+            
+            # 3. Pressure and shear correlation (they should be related in physical flows)
+            if len(p_coeff) > 1 and len(tau_magnitude) > 1:
+                correlation_loss = 1.0 - torch.abs(torch.corrcoef(torch.stack([p_coeff, tau_magnitude]))[0, 1])
+            else:
+                correlation_loss = torch.tensor(0.0, device=predictions.device)
+            
+            return {
+                'physical_consistency_loss': p_range_penalty + tau_range_penalty + 0.1 * correlation_loss,
+                'pressure_range_penalty': p_range_penalty,
+                'shear_range_penalty': tau_range_penalty,
+                'pressure_shear_correlation_loss': correlation_loss,
+                'pressure_coefficient_range': (torch.min(p_coeff), torch.max(p_coeff)),
+                'shear_magnitude_range': (torch.min(tau_magnitude), torch.max(tau_magnitude))
+            }
+            
+        except Exception as e:
+            print(f"Warning: Physical consistency loss failed: {e}")
+            return {
+                'physical_consistency_loss': torch.tensor(0.0, device=predictions.device),
+                'pressure_range_penalty': torch.tensor(0.0, device=predictions.device),
+                'shear_range_penalty': torch.tensor(0.0, device=predictions.device),
+                'pressure_shear_correlation_loss': torch.tensor(0.0, device=predictions.device),
+                'pressure_coefficient_range': (torch.tensor(0.0), torch.tensor(0.0)),
+                'shear_magnitude_range': (torch.tensor(0.0), torch.tensor(0.0))
+            }
+    
+    def spatial_coherence_loss(self, predictions: torch.Tensor, data: Any) -> Dict[str, torch.Tensor]:
+        """Enforce spatial coherence in fields"""
+        try:
+            if hasattr(data, 'edge_index'):
+                edge_index = data.edge_index
+                row, col = edge_index
+                
+                # Compute differences across edges
+                edge_diff = predictions[row] - predictions[col]
+                
+                # Separate losses for each component
+                p_coherence = torch.mean(edge_diff[:, 0]**2)
+                tau_x_coherence = torch.mean(edge_diff[:, 1]**2)
+                tau_y_coherence = torch.mean(edge_diff[:, 2]**2)
+                tau_z_coherence = torch.mean(edge_diff[:, 3]**2)
+                
+                total_coherence = p_coherence + tau_x_coherence + tau_y_coherence + tau_z_coherence
+                
+                return {
+                    'spatial_coherence_loss': total_coherence,
+                    'pressure_coherence': p_coherence,
+                    'shear_x_coherence': tau_x_coherence,
+                    'shear_y_coherence': tau_y_coherence,
+                    'shear_z_coherence': tau_z_coherence
+                }
+            else:
+                return {
+                    'spatial_coherence_loss': torch.tensor(0.0, device=predictions.device),
+                    'pressure_coherence': torch.tensor(0.0, device=predictions.device),
+                    'shear_x_coherence': torch.tensor(0.0, device=predictions.device),
+                    'shear_y_coherence': torch.tensor(0.0, device=predictions.device),
+                    'shear_z_coherence': torch.tensor(0.0, device=predictions.device)
+                }
+                
+        except Exception as e:
+            print(f"Warning: Spatial coherence loss failed: {e}")
+            return {
+                'spatial_coherence_loss': torch.tensor(0.0, device=predictions.device),
+                'pressure_coherence': torch.tensor(0.0, device=predictions.device),
+                'shear_x_coherence': torch.tensor(0.0, device=predictions.device),
+                'shear_y_coherence': torch.tensor(0.0, device=predictions.device),
+                'shear_z_coherence': torch.tensor(0.0, device=predictions.device)
+            }
 
-def compute_smoothness_loss(pred, edge_index):
-    """Compute smoothness loss over edges"""
-    edge_index = edge_index.to(pred.device)
-    src, dst = edge_index
-    diff = pred[src] - pred[dst]
-    return diff.pow(2).mean()
 
-# ============================================
-# PINN Loss Functions with Pressure-WSS Coupling
-# ============================================
-
-def compute_pressure_gradient(pressure, pos, edge_index, eps=1e-8):
+def compute_corrected_comprehensive_loss(predictions: torch.Tensor, targets: torch.Tensor, 
+                                       data: Any, loss_weights: Optional[Dict[str, float]] = None,
+                                       return_components: bool = True) -> Dict[str, torch.Tensor]:
     """
-    Compute pressure gradient along surface edges
+    Compute comprehensive loss for pressure coefficient and wall shear stress data
     
     Args:
-        pressure: Pressure field [N, 1] or [N]
-        pos: Node positions [N, 3] or [N, 2]
-        edge_index: Edge connectivity [2, E]
-        eps: Small value to avoid division by zero
-        
+        predictions: [N, 4] tensor [pressure_coeff, tau_x, tau_y, tau_z]
+        targets: [N, 4] tensor with same structure
+        data: Data object containing position and connectivity info
+        loss_weights: Optional custom loss weights
+        return_components: Whether to return detailed component breakdown
+    
     Returns:
-        pressure_grad: Pressure gradient magnitude per edge [E]
-        pressure_grad_vec: Pressure gradient vector per edge [E, spatial_dim]
+        Dictionary with loss components and total loss
     """
-    if pressure.dim() == 2 and pressure.shape[1] == 1:
-        pressure = pressure.squeeze(-1)
     
-    src, dst = edge_index
+    device = predictions.device
+    pinn_loss = CorrectedPINNLoss(loss_weights)
+    pinn_loss = pinn_loss.to(device)
     
-    # Pressure difference
-    dp = pressure[dst] - pressure[src]
-    
-    # Spatial difference
-    dx = pos[dst] - pos[src]  # [E, spatial_dim]
-    dist = torch.norm(dx, dim=1, keepdim=True) + eps  # [E, 1]
-    
-    # Pressure gradient magnitude
-    pressure_grad_mag = torch.abs(dp) / dist.squeeze(-1)  # [E]
-    
-    # Pressure gradient vector (normalized direction)
-    direction = dx / dist  # [E, spatial_dim]
-    pressure_grad_vec = dp.unsqueeze(-1) * direction / dist  # [E, spatial_dim]
-    
-    return pressure_grad_mag, pressure_grad_vec
-
-def compute_wall_shear_stress(velocity_pred, pos, edge_index, wall_normal=None, eps=1e-8):
-    """
-    Compute wall shear stress from velocity predictions
-    
-    Args:
-        velocity_pred: Velocity predictions [N, 3] or [N, 2]
-        pos: Node positions [N, 3] or [N, 2] 
-        edge_index: Edge connectivity [2, E]
-        wall_normal: Wall normal vectors [N, 3] or [N, 2], if available
-        eps: Small value to avoid division by zero
-        
-    Returns:
-        wss_magnitude: WSS magnitude per node [N]
-        wss_vector: WSS vector per node [N, spatial_dim]
-    """
-    num_nodes = velocity_pred.shape[0]
-    spatial_dim = velocity_pred.shape[1]
-    
-    src, dst = edge_index
-    
-    # Velocity difference across edges
-    du = velocity_pred[dst] - velocity_pred[src]  # [E, spatial_dim]
-    
-    # Spatial difference
-    dx = pos[dst] - pos[src]  # [E, spatial_dim]
-    dist = torch.norm(dx, dim=1, keepdim=True) + eps  # [E, 1]
-    
-    # Velocity gradient approximation: du/dx
-    velocity_grad = du / dist  # [E, spatial_dim]
-    
-    # Aggregate velocity gradients to nodes (average over connected edges)
-    node_velocity_grad = torch.zeros(num_nodes, spatial_dim, device=velocity_pred.device)
-    node_count = torch.zeros(num_nodes, 1, device=velocity_pred.device)
-    
-    # Add contributions from both source and destination nodes
-    node_velocity_grad.index_add_(0, dst, velocity_grad)
-    node_velocity_grad.index_add_(0, src, -velocity_grad)  # Negative for reverse direction
-    node_count.index_add_(0, dst, torch.ones_like(dist))
-    node_count.index_add_(0, src, torch.ones_like(dist))
-    
-    # Average the gradients
-    node_velocity_grad = node_velocity_grad / (node_count + eps)
-    
-    # Compute WSS magnitude (simplified as velocity gradient magnitude)
-    wss_magnitude = torch.norm(node_velocity_grad, dim=1)  # [N]
-    
-    # If wall normals are provided, compute wall-tangential component
-    if wall_normal is not None:
-        # WSS = velocity_gradient - (velocity_gradient · normal) * normal
-        normal_component = torch.sum(node_velocity_grad * wall_normal, dim=1, keepdim=True)
-        wss_vector = node_velocity_grad - normal_component * wall_normal
-        wss_magnitude = torch.norm(wss_vector, dim=1)
-        return wss_magnitude, wss_vector
-    
-    return wss_magnitude, node_velocity_grad
-
-def pressure_wss_coupling_loss(pred, pos, edge_index, 
-                              pressure_weight=1.0, wss_weight=1.0,
-                              separation_threshold=0.1, attachment_threshold=2.0,
-                              eps=1e-8):
-    """
-    Physics-informed loss enforcing pressure gradient and WSS relationship
-    
-    Physical relationships:
-    - Adverse pressure gradient (dp/dx > 0) → low WSS (flow separation)
-    - Favorable pressure gradient (dp/dx < 0) → high WSS (flow attachment)
-    
-    Args:
-        pred: Model predictions [N, output_dim]
-               Assumes: [pressure, velocity_x, velocity_y, (velocity_z)]
-        pos: Node positions [N, spatial_dim]
-        edge_index: Edge connectivity [2, E]
-        pressure_weight: Weight for pressure gradient penalty
-        wss_weight: Weight for WSS penalty
-        separation_threshold: WSS threshold below which flow is considered separated
-        attachment_threshold: WSS threshold above which flow is considered attached
-        eps: Small value for numerical stability
-        
-    Returns:
-        loss: Physics-informed coupling loss
-        loss_components: Dictionary with individual loss components
-    """
-    if pred.shape[1] < 3:
-        raise ValueError("Predictions must include at least pressure and 2D velocity")
-    
-    # Extract pressure and velocity
-    pressure = pred[:, 0]  # [N]
-    velocity = pred[:, 1:4] if pred.shape[1] >= 4 else pred[:, 1:3]  # [N, spatial_dim]
-    
-    # Compute pressure gradients
-    pressure_grad_mag, pressure_grad_vec = compute_pressure_gradient(
-        pressure, pos, edge_index, eps=eps
-    )
-    
-    # Compute wall shear stress
-    wss_magnitude, wss_vector = compute_wall_shear_stress(
-        velocity, pos, edge_index, eps=eps
-    )
-    
-    # Map edge-based pressure gradients to nodes (average)
-    num_nodes = pred.shape[0]
-    src, dst = edge_index
-    
-    node_pressure_grad = torch.zeros(num_nodes, device=pred.device)
-    node_count = torch.zeros(num_nodes, device=pred.device)
-    
-    # Add pressure gradient contributions to connected nodes
-    node_pressure_grad.index_add_(0, src, pressure_grad_mag)
-    node_pressure_grad.index_add_(0, dst, pressure_grad_mag)
-    node_count.index_add_(0, src, torch.ones_like(pressure_grad_mag))
-    node_count.index_add_(0, dst, torch.ones_like(pressure_grad_mag))
-    
-    node_pressure_grad = node_pressure_grad / (node_count + eps)
-    
-    # Determine pressure gradient sign (simplified: use pressure gradient magnitude)
-    # Positive gradient = adverse, Negative gradient = favorable
-    adverse_mask = node_pressure_grad > eps  # Adverse pressure gradient regions
-    favorable_mask = node_pressure_grad > eps  # For this implementation, we focus on magnitude
-    
-    # Physics-based penalties
     loss_components = {}
     
-    # Penalty 1: Adverse pressure gradient should have low WSS
-    adverse_penalty = torch.mean(
-        adverse_mask.float() * torch.relu(wss_magnitude - separation_threshold) ** 2
-    )
+    # 1. Basic MSE Loss (most important for data fitting)
+    mse_loss = F.mse_loss(predictions, targets)
+    loss_components['mse'] = mse_loss
     
-    # Penalty 2: High pressure gradient should correspond to appropriate WSS
-    # For separation: high pressure gradient + high WSS is penalized
-    separation_penalty = torch.mean(
-        (node_pressure_grad ** 2) * torch.relu(wss_magnitude - separation_threshold) ** 2
-    )
-    
-    # Penalty 3: Smoothness constraint on WSS field
-    wss_smoothness = compute_smoothness_loss(wss_magnitude.unsqueeze(-1), edge_index)
-    
-    # Penalty 4: Pressure gradient smoothness
-    pressure_grad_smoothness = torch.mean(
-        (pressure_grad_mag[:-1] - pressure_grad_mag[1:]) ** 2
-    )
-    
-    # Total loss
-    total_loss = (
-        pressure_weight * separation_penalty +
-        wss_weight * adverse_penalty +
-        0.1 * wss_smoothness +
-        0.1 * pressure_grad_smoothness
-    )
-    
-    loss_components.update({
-        'separation_penalty': separation_penalty.item(),
-        'adverse_penalty': adverse_penalty.item(),
-        'wss_smoothness': wss_smoothness.item(),
-        'pressure_grad_smoothness': pressure_grad_smoothness.item(),
-        'total_physics_loss': total_loss.item()
-    })
-    
-    return total_loss, loss_components
-
-def advanced_pinn_loss(pred, batch, 
-                      physics_weight=1.0, smoothness_weight=0.1,
-                      pressure_weight=1.0, wss_weight=1.0,
-                      include_original_physics=True):
-    """
-    Advanced PINN loss combining multiple physics constraints
-    
-    Args:
-        pred: Model predictions [N, output_dim]
-        batch: Batch data containing pos, edge_index, etc.
-        physics_weight: Weight for physics-informed coupling loss
-        smoothness_weight: Weight for smoothness regularization
-        pressure_weight: Weight for pressure gradient penalties
-        wss_weight: Weight for WSS penalties
-        include_original_physics: Whether to include original physics loss
-        
-    Returns:
-        total_loss: Combined physics-informed loss
-        loss_dict: Dictionary with all loss components
-    """
-    device = pred.device
-    loss_dict = {}
-    
-    # Original physics loss (if requested)
-    if include_original_physics and hasattr(batch, 'pos'):
-        original_physics_loss = compute_physics_loss(pred, batch)
-        loss_dict['original_physics'] = original_physics_loss.item()
-    else:
-        original_physics_loss = torch.tensor(0.0, device=device)
-        loss_dict['original_physics'] = 0.0
-    
-    # Smoothness regularization
-    if hasattr(batch, 'edge_index'):
-        smoothness_loss = compute_smoothness_loss(pred, batch.edge_index)
-        loss_dict['smoothness'] = smoothness_loss.item()
-    else:
-        smoothness_loss = torch.tensor(0.0, device=device)
-        loss_dict['smoothness'] = 0.0
-    
-    # Pressure-WSS coupling loss (main contribution)
-    if hasattr(batch, 'pos') and hasattr(batch, 'edge_index') and pred.shape[1] >= 3:
-        coupling_loss, coupling_components = pressure_wss_coupling_loss(
-            pred, batch.pos, batch.edge_index,
-            pressure_weight=pressure_weight,
-            wss_weight=wss_weight
-        )
-        loss_dict.update(coupling_components)
-    else:
-        coupling_loss = torch.tensor(0.0, device=device)
-        loss_dict.update({
-            'separation_penalty': 0.0,
-            'adverse_penalty': 0.0,
-            'wss_smoothness': 0.0,
-            'pressure_grad_smoothness': 0.0,
-            'total_physics_loss': 0.0
-        })
-    
-    # Combine all losses
-    total_loss = (
-        original_physics_loss +
-        physics_weight * coupling_loss +
-        smoothness_weight * smoothness_loss
-    )
-    
-    loss_dict['total_loss'] = total_loss.item()
-    
-    return total_loss, loss_dict
-
-# ============================================
-# Individual PINN Loss Functions for Notebook Integration
-# ============================================
-
-def compute_pinn_loss(pred, batch, physics_weight=1.0, pressure_weight=0.5, wss_weight=0.5):
-    """
-    Main PINN loss function combining pressure-WSS physics
-    
-    Args:
-        pred: Model predictions [N, output_dim]
-        batch: Batch data with pos, edge_index
-        physics_weight: Overall physics weight
-        pressure_weight: Pressure gradient weight
-        wss_weight: WSS penalty weight
-        
-    Returns:
-        pinn_loss: Combined physics-informed loss
-    """
-    if not (hasattr(batch, 'pos') and hasattr(batch, 'edge_index') and pred.shape[1] >= 3):
-        return torch.tensor(0.0, device=pred.device)
-    
-    # Use the advanced PINN loss with specific weights
-    total_loss, _ = advanced_pinn_loss(
-        pred, batch,
-        physics_weight=physics_weight,
-        pressure_weight=pressure_weight,
-        wss_weight=wss_weight,
-        include_original_physics=False  # Focus on pressure-WSS coupling
-    )
-    
-    return total_loss
-
-def compute_pressure_gradient_loss(pred, batch, threshold=0.1, smoothness_weight=0.1):
-    """
-    Pressure gradient consistency loss
-    
-    Args:
-        pred: Model predictions [N, output_dim] (pressure in first column)
-        batch: Batch data with pos, edge_index
-        threshold: Threshold for pressure gradient penalties
-        smoothness_weight: Weight for gradient smoothness
-        
-    Returns:
-        pressure_loss: Pressure gradient loss
-    """
-    if not (hasattr(batch, 'pos') and hasattr(batch, 'edge_index') and pred.shape[1] >= 1):
-        return torch.tensor(0.0, device=pred.device)
-    
+    # 2. Pressure-based losses
     try:
-        pressure = pred[:, 0]  # Extract pressure
-        
-        # Compute pressure gradients
-        pressure_grad_mag, _ = compute_pressure_gradient(
-            pressure, batch.pos, batch.edge_index
-        )
-        
-        # Penalty for excessive pressure gradients
-        gradient_penalty = torch.mean(torch.relu(pressure_grad_mag - threshold) ** 2)
-        
-        # Smoothness penalty for pressure gradient field
-        if len(pressure_grad_mag) > 1:
-            gradient_smoothness = torch.mean(
-                (pressure_grad_mag[:-1] - pressure_grad_mag[1:]) ** 2
-            )
+        if hasattr(data, 'pos') and data.pos is not None:
+            pos = data.pos.clone().detach().requires_grad_(True)
+            pred_physics = predictions.clone().requires_grad_(True)
+            
+            # Pressure smoothness
+            pressure_results = pinn_loss.pressure_smoothness_loss(pred_physics, pos)
+            loss_components.update(pressure_results)
+            
         else:
-            gradient_smoothness = torch.tensor(0.0, device=pred.device)
-        
-        total_loss = gradient_penalty + smoothness_weight * gradient_smoothness
-        
-        return total_loss
-        
-    except Exception:
-        # Fallback to simple pressure smoothness
-        return compute_smoothness_loss(pred[:, 0:1], batch.edge_index)
-
-def compute_wall_shear_stress_loss(pred, batch, separation_threshold=0.1, attachment_threshold=2.0):
-    """
-    Wall shear stress physics loss
+            # Fallback without spatial gradients
+            p_coeff = predictions[:, 0]
+            if len(p_coeff) > 1:
+                pressure_smoothness = torch.var(torch.diff(p_coeff))
+                loss_components['pressure_smoothness_loss'] = pressure_smoothness
+            else:
+                loss_components['pressure_smoothness_loss'] = torch.tensor(0.0, device=device)
+                
+    except Exception as e:
+        print(f"Warning: Pressure loss computation failed: {e}")
+        loss_components['pressure_smoothness_loss'] = torch.tensor(0.0, device=device)
     
-    Args:
-        pred: Model predictions [N, output_dim] (velocity in columns 1+)
-        batch: Batch data with pos, edge_index
-        separation_threshold: WSS threshold for flow separation
-        attachment_threshold: WSS threshold for flow attachment
-        
-    Returns:
-        wss_loss: Wall shear stress physics loss
-    """
-    if not (hasattr(batch, 'pos') and hasattr(batch, 'edge_index') and pred.shape[1] >= 3):
-        return torch.tensor(0.0, device=pred.device)
-    
+    # 3. Wall shear stress losses
     try:
-        # Extract velocity components
-        velocity = pred[:, 1:4] if pred.shape[1] >= 4 else pred[:, 1:3]
+        if hasattr(data, 'pos') and data.pos is not None:
+            pos = data.pos.clone().detach().requires_grad_(True)
+            pred_physics = predictions.clone().requires_grad_(True)
+            
+            shear_results = pinn_loss.shear_stress_losses(pred_physics, pos)
+            loss_components.update(shear_results)
+        else:
+            # Simplified shear losses without gradients
+            tau_x, tau_y, tau_z = predictions[:, 1], predictions[:, 2], predictions[:, 3]
+            if len(tau_x) > 1:
+                shear_smoothness = (torch.var(torch.diff(tau_x)) + 
+                                  torch.var(torch.diff(tau_y)) + 
+                                  torch.var(torch.diff(tau_z))) / 3
+                loss_components['shear_stress_smoothness_loss'] = shear_smoothness
+            else:
+                loss_components['shear_stress_smoothness_loss'] = torch.tensor(0.0, device=device)
+                
+    except Exception as e:
+        print(f"Warning: Shear stress loss computation failed: {e}")
+        loss_components['shear_stress_smoothness_loss'] = torch.tensor(0.0, device=device)
+    
+    # 4. Wall shear balance loss
+    try:
+        balance_results = pinn_loss.wall_shear_balance_loss(predictions)
+        loss_components.update(balance_results)
+    except Exception as e:
+        print(f"Warning: Wall shear balance loss failed: {e}")
+        loss_components['wall_shear_balance_loss'] = torch.tensor(0.0, device=device)
+    
+    # 5. Physical consistency
+    try:
+        consistency_results = pinn_loss.physical_consistency_loss(predictions)
+        loss_components.update(consistency_results)
+    except Exception as e:
+        print(f"Warning: Physical consistency loss failed: {e}")
+        loss_components['physical_consistency_loss'] = torch.tensor(0.0, device=device)
+    
+    # 6. Spatial coherence
+    try:
+        coherence_results = pinn_loss.spatial_coherence_loss(predictions, data)
+        loss_components.update(coherence_results)
+    except Exception as e:
+        print(f"Warning: Spatial coherence loss failed: {e}")
+        loss_components['spatial_coherence_loss'] = torch.tensor(0.0, device=device)
+    
+    # 7. Simple gradient-based losses for available data
+    if len(predictions) > 1:
+        # Pressure gradient loss
+        p_grad = torch.diff(predictions[:, 0])
+        loss_components['pressure_gradient'] = torch.mean(p_grad**2) * 0.1
         
-        # Compute wall shear stress
-        wss_magnitude, _ = compute_wall_shear_stress(velocity, batch.pos, batch.edge_index)
-        
-        # Physics-based penalties
-        # Penalty for unphysical WSS values (too high or too low)
-        low_wss_penalty = torch.mean(torch.relu(separation_threshold - wss_magnitude) ** 2)
-        high_wss_penalty = torch.mean(torch.relu(wss_magnitude - attachment_threshold) ** 2)
-        
-        # WSS field smoothness
-        wss_smoothness = compute_smoothness_loss(wss_magnitude.unsqueeze(-1), batch.edge_index)
-        
-        total_loss = low_wss_penalty + 0.1 * high_wss_penalty + 0.1 * wss_smoothness
-        
+        # Multi-component correlation
+        tau_magnitude = torch.sqrt(predictions[:, 1]**2 + predictions[:, 2]**2 + predictions[:, 3]**2 + 1e-8)
+        if len(tau_magnitude) > 1:
+            corr_matrix = torch.corrcoef(torch.stack([predictions[:, 0], tau_magnitude]))
+            correlation_loss = 1.0 - torch.abs(corr_matrix[0, 1])
+            loss_components['multi_component_correlation'] = correlation_loss
+        else:
+            loss_components['multi_component_correlation'] = torch.tensor(0.0, device=device)
+    else:
+        loss_components['pressure_gradient'] = torch.tensor(0.0, device=device)
+        loss_components['multi_component_correlation'] = torch.tensor(0.0, device=device)
+    
+    # 8. Compute weighted total loss
+    weights = loss_weights or pinn_loss.default_weights
+    total_loss = torch.tensor(0.0, device=device)
+    
+    for loss_name, loss_value in loss_components.items():
+        if loss_name in weights and isinstance(loss_value, torch.Tensor):
+            weighted_loss = weights[loss_name] * loss_value
+            total_loss = total_loss + weighted_loss
+            loss_components[f'{loss_name}_weighted'] = weighted_loss
+    
+    loss_components['total_loss'] = total_loss
+    
+    # 9. Add statistics
+    valid_losses = [v for k, v in loss_components.items() 
+                   if isinstance(v, torch.Tensor) and not k.endswith('_weighted') 
+                   and k not in ['total_loss', 'pressure_coefficient_range', 'shear_magnitude_range']]
+    
+    if valid_losses:
+        loss_components['loss_statistics'] = {
+            'mean': torch.stack(valid_losses).mean(),
+            'std': torch.stack(valid_losses).std(),
+            'max': torch.stack(valid_losses).max(),
+            'min': torch.stack(valid_losses).min(),
+            'num_components': len(valid_losses)
+        }
+    
+    if return_components:
+        return {
+            'loss_components': loss_components,
+            'total_loss': total_loss,
+            'weights_used': weights,
+            'data_structure': 'pressure_coefficient + wall_shear_stress_components'
+        }
+    else:
         return total_loss
-        
-    except Exception:
-        # Fallback to velocity field smoothness
-        velocity = pred[:, 1:4] if pred.shape[1] >= 4 else pred[:, 1:3]
-        return compute_smoothness_loss(velocity, batch.edge_index)

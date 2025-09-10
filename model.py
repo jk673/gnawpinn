@@ -8,8 +8,7 @@ from typing import Optional, List
 
 class MeshGraphNetsProcessor(MessagePassing):
     """
-    Enhanced MeshGraphNets-style processor with improvements
-    Compatible with various PyTorch Geometric versions
+    Fixed MeshGraphNets-style processor 
     """
     def __init__(self, latent_size=128, num_layers=15, dropout=0.1):
         super().__init__(aggr='add')
@@ -40,34 +39,47 @@ class MeshGraphNetsProcessor(MessagePassing):
                 nn.Linear(latent_size * 2, latent_size),
                 nn.LayerNorm(latent_size)
             ))
-        
-        # Store edge attributes as class variable for message passing
-        self.edge_attr = None
     
     def forward(self, x, edge_index, edge_attr, batch=None):
         for i in range(self.num_layers):
             # Update edges
             row, col = edge_index
             edge_input = torch.cat([x[row], x[col], edge_attr], dim=1)
-            edge_attr = edge_attr + self.edge_models[i](edge_input)
+            edge_attr_new = self.edge_models[i](edge_input)
+            edge_attr = edge_attr + edge_attr_new
             
-            # Store edge_attr for message function
-            self.edge_attr = edge_attr
-            
-            # Update nodes with message passing
+            # Message passing: aggregate edge attributes to nodes
             x_residual = x
-            x_aggregated = self.propagate(edge_index, size=(x.size(0), x.size(0)))
-            x = x_residual + self.node_models[i](torch.cat([x_residual, x_aggregated], dim=1))
+            
+            # Manual aggregation (more reliable)
+            num_nodes = x.size(0)
+            x_aggregated = torch.zeros_like(x)
+            
+            # Add edge attributes to destination nodes
+            x_aggregated.index_add_(0, col, edge_attr)
+            
+            # Count neighbors for averaging
+            ones = torch.ones(edge_index.size(1), 1, device=x.device, dtype=x.dtype)
+            count = torch.zeros(num_nodes, 1, device=x.device, dtype=x.dtype)
+            count.index_add_(0, col, ones)
+            count = count.clamp(min=1)  # Avoid division by zero
+            
+            # Average aggregation
+            x_aggregated = x_aggregated / count
+            
+            # Update nodes
+            node_input = torch.cat([x_residual, x_aggregated], dim=1)
+            x_update = self.node_models[i](node_input)
+            x = x_residual + x_update
             
         return x, edge_attr
     
-    def message(self, x_j=None):
-        """Define how messages are computed"""
-        # Use stored edge attributes as messages
-        return self.edge_attr
+    def message(self, x_j, edge_attr):
+        """This won't be used since we do manual aggregation"""
+        return edge_attr
     
     def update(self, aggr_out):
-        """Define how node embeddings are updated"""
+        """This won't be used since we do manual aggregation"""
         return aggr_out
 
 class SimpleMeshProcessor(nn.Module):
@@ -142,37 +154,30 @@ class SimpleMeshProcessor(nn.Module):
         return x, edge_attr
 
 class CFDSurrogateModel(torch.nn.Module):
-    """Complete CFD Surrogate Model with flexible processor choice"""
-    def __init__(self, node_feat_dim, hidden_dim, output_dim, num_mp_layers=10, 
-                 edge_feat_dim=8, use_simple=True):  # Added edge_feat_dim parameter
+    """Complete CFD Surrogate Model with MeshGraphNets processor"""
+    def __init__(self, node_feat_dim=7, hidden_dim=128, output_dim=4, num_mp_layers=10, 
+                 edge_feat_dim=8):
         super().__init__()
         
-        self.node_feat_dim = node_feat_dim
+        self.node_feat_dim = node_feat_dim  # Default: [x, y, z, normal_x, normal_y, normal_z, area]
         self.hidden_dim = hidden_dim
         
-        # Input encoding - will be created dynamically if needed
+        # Input encoding for 7D node features
         self.encoder = torch.nn.Sequential(
             torch.nn.Linear(node_feat_dim, hidden_dim),
             torch.nn.LayerNorm(hidden_dim),
             torch.nn.GELU()
         )
         
-        # Edge feature encoder - now accepts edge_feat_dim dimensions
+        # Edge feature encoder
         self.edge_encoder = torch.nn.Linear(edge_feat_dim, hidden_dim)
         
-        # Choose processor based on compatibility
-        if use_simple:
-            self.processor = SimpleMeshProcessor(
-                latent_size=hidden_dim,
-                num_layers=num_mp_layers,
-                dropout=0.1
-            )
-        else:
-            self.processor = MeshGraphNetsProcessor(
-                latent_size=hidden_dim,
-                num_layers=num_mp_layers,
-                dropout=0.1
-            )
+        # Always use MeshGraphNets processor (fixed compatibility)
+        self.processor = MeshGraphNetsProcessor(
+            latent_size=hidden_dim,
+            num_layers=num_mp_layers,
+            dropout=0.1
+        )
         
         # Output decoding
         self.decoder = torch.nn.Sequential(
@@ -182,88 +187,88 @@ class CFDSurrogateModel(torch.nn.Module):
         )
     
     def forward(self, data):
-        # Ensure node features exist
+        # Ensure node features exist (expect 7D: [x, y, z, normal_x, normal_y, normal_z, area])
         if not hasattr(data, 'x') or data.x is None:
-            # Fallback: create node features from positions if available
-            if hasattr(data, 'pos') and data.pos is not None:
-                data.x = data.pos
-            else:
-                # Last resort: create dummy features
-                num_nodes = data.edge_index.max().item() + 1
-                data.x = torch.randn(num_nodes, 3, device=data.edge_index.device)
+            raise ValueError("Node features (data.x) must be provided with 7 dimensions: [x, y, z, normal_x, normal_y, normal_z, area]")
         
-        # Handle dimension mismatch by recreating encoder if needed
-        actual_feat_dim = data.x.shape[1]
-        if actual_feat_dim != self.node_feat_dim:
-            # Recreate encoder with correct input dimension
-            self.encoder = torch.nn.Sequential(
-                torch.nn.Linear(actual_feat_dim, self.hidden_dim),
-                torch.nn.LayerNorm(self.hidden_dim),
-                torch.nn.GELU()
-            ).to(data.x.device)
-            self.node_feat_dim = actual_feat_dim
+        # Validate node feature dimensions
+        if data.x.shape[1] != self.node_feat_dim:
+            raise ValueError(f"Expected {self.node_feat_dim}D node features, got {data.x.shape[1]}D. "
+                           "Required: [x, y, z, normal_x, normal_y, normal_z, area]")
         
-        # Encode node features
+        # Ensure pos field exists for physics loss calculations
+        if not hasattr(data, 'pos') or data.pos is None:
+            # Create pos from first 3 dimensions of x (coordinates)
+            data.pos = data.x[:, :3].clone().requires_grad_(True)
+        else:
+            # Ensure pos requires gradient for physics loss
+            if not data.pos.requires_grad:
+                data.pos = data.pos.requires_grad_(True)
+        
+        # Encode node features (7D → hidden_dim)
         x = self.encoder(data.x)
         
         # Process edge features
         if hasattr(data, 'edge_attr') and data.edge_attr is not None:
-            edge_attr = data.edge_attr
-            # No need to unsqueeze since edge_attr is already [E, 8]
-            # Transform to hidden_dim
-            edge_attr = self.edge_encoder(edge_attr)
+            if data.edge_attr.shape[1] != self.edge_encoder.in_features:
+                raise ValueError(f"Expected {self.edge_encoder.in_features}D edge features, got {data.edge_attr.shape[1]}D")
+            edge_attr = self.edge_encoder(data.edge_attr)
         else:
-            # Create edge features based on distance if not provided
-            row, col = data.edge_index
-            if hasattr(data, 'pos'):
-                edge_vec = data.pos[col] - data.pos[row]
-                edge_length = torch.norm(edge_vec, dim=1, keepdim=True)
-                # Pad to match edge_feat_dim if creating from scratch
-                edge_attr = torch.cat([edge_length] + [torch.zeros_like(edge_length)] * 7, dim=1)
-                edge_attr = self.edge_encoder(edge_attr)
-            else:
-                # Random initialization as fallback
-                edge_attr = torch.randn(data.edge_index.size(1), x.size(1), device=x.device)
+            # Create edge features if not provided
+            edge_attr = self._create_edge_features(data, x.device)
         
         # Get batch if available
         batch = data.batch if hasattr(data, 'batch') else None
         
-        # Message passing
+        # Message passing with MeshGraphNets
         x, edge_attr = self.processor(x, data.edge_index, edge_attr, batch)
         
-        # Decode to output
+        # Decode to output (hidden_dim → 4D: [pressure_coeff, tau_x, tau_y, tau_z])
         out = self.decoder(x)
         
         return out
-
-class VortexNetCorrection(nn.Module):
-    """VortexNet-style multi-fidelity correction network"""
-    def __init__(self, input_dim, hidden_dim=128):
-        super().__init__()
-        
-        self.correction_net = nn.Sequential(
-            nn.Linear(input_dim * 2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
-        
-        self.confidence_net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
     
-    def forward(self, low_fidelity, features):
-        combined = torch.cat([low_fidelity, features], dim=-1)
-        correction = self.correction_net(combined)
-        confidence = self.confidence_net(features)
-        high_fidelity = low_fidelity + confidence * correction
-        return high_fidelity, confidence
+    def _create_edge_features(self, data, device):
+        """Create edge features from node geometry if not provided"""
+        row, col = data.edge_index
+        
+        # Extract positions (first 3 dimensions)
+        pos_i = data.x[row, :3]  # Source positions
+        pos_j = data.x[col, :3]  # Target positions
+        
+        # Extract normals (dimensions 3-5)
+        normal_i = data.x[row, 3:6]
+        normal_j = data.x[col, 3:6]
+        
+        # Extract areas (dimension 6)
+        area_i = data.x[row, 6:7]
+        area_j = data.x[col, 6:7]
+        
+        # Compute edge features (8D)
+        edge_vec = pos_j - pos_i                    # [3D] Edge vector
+        edge_length = torch.norm(edge_vec, dim=1, keepdim=True)  # [1D] Edge length
+        
+        # Dot product of normals (geometric relationship)
+        normal_dot = torch.sum(normal_i * normal_j, dim=1, keepdim=True)  # [1D]
+        
+        # Area ratio
+        area_ratio = area_i / (area_j + 1e-8)       # [1D] Area ratio
+        
+        # Combined geometric features
+        edge_dir = edge_vec / (edge_length + 1e-8)  # [3D] Normalized edge direction
+        
+        # Concatenate all edge features [3 + 1 + 1 + 1 + 2] = 8D
+        edge_attr = torch.cat([
+            edge_dir,        # [3D] Edge direction
+            edge_length,     # [1D] Edge length  
+            normal_dot,      # [1D] Normal alignment
+            area_ratio,      # [1D] Area ratio
+            area_i,          # [1D] Source area
+            area_j           # [1D] Target area
+        ], dim=1)
+        
+        return self.edge_encoder(edge_attr)
+
 
 class GeometricMultiGridEncoder(nn.Module):
     """
